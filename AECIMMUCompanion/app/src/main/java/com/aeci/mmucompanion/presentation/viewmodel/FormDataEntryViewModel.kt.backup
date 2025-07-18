@@ -1,0 +1,791 @@
+package com.aeci.mmucompanion.presentation.viewmodel
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.aeci.mmucompanion.domain.model.FormField
+import com.aeci.mmucompanion.domain.model.FormFieldType
+import com.aeci.mmucompanion.domain.model.FormSection
+import com.aeci.mmucompanion.domain.model.FormTemplate
+import com.aeci.mmucompanion.domain.model.FormType
+import com.aeci.mmucompanion.domain.model.ValidationRule
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+import com.aeci.mmucompanion.domain.service.PDFExportService
+import java.io.File
+import java.time.LocalDateTime
+
+data class FormDataEntryUiState(
+    val isLoading: Boolean = false,
+    val error: String? = null,
+    val formTitle: String = "",
+    val formSections: List<FormSection> = emptyList(),
+    val formData: Map<String, String> = emptyMap(),
+    val fieldErrors: Map<String, String> = emptyMap(),
+    val canExport: Boolean = false,
+    val isSaving: Boolean = false,
+    val isExporting: Boolean = false
+)
+
+@HiltViewModel
+class FormDataEntryViewModel @Inject constructor(
+    private val pdfExportService: PDFExportService
+    // TODO: Inject form repository when implemented
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow(FormDataEntryUiState())
+    val uiState: StateFlow<FormDataEntryUiState> = _uiState.asStateFlow()
+
+    fun loadForm(formType: String) {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true) }
+            
+            try {
+                val formTemplate = getFormTemplate(formType)
+                val initialData = formTemplate.sections.flatMap { section ->
+                    section.fields.map { field ->
+                        field.fieldName to (field.defaultValue ?: "")
+                    }
+                }.toMap()
+                
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        formTitle = formTemplate.title,
+                        formSections = formTemplate.sections,
+                        formData = initialData
+                    )
+                }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isLoading = false,
+                        error = e.message ?: "Failed to load form"
+                    )
+                }
+            }
+        }
+    }
+
+    fun updateFieldValue(fieldName: String, value: String) {
+        _uiState.update { state ->
+            val newFormData = state.formData.toMutableMap()
+            newFormData[fieldName] = value
+            
+            // Clear field error if it exists
+            val newFieldErrors = state.fieldErrors.toMutableMap()
+            newFieldErrors.remove(fieldName)
+            
+            state.copy(
+                formData = newFormData,
+                fieldErrors = newFieldErrors,
+                canExport = validateForm(state.formSections, newFormData).isEmpty()
+            )
+        }
+    }
+
+    fun saveForm() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isSaving = true) }
+            
+            try {
+                val validationErrors = validateForm(uiState.value.formSections, uiState.value.formData)
+                
+                if (validationErrors.isNotEmpty()) {
+                    _uiState.update {
+                        it.copy(
+                            isSaving = false,
+                            fieldErrors = validationErrors,
+                            error = "Please fix the validation errors"
+                        )
+                    }
+                    return@launch
+                }
+                
+                // TODO: Save form data to repository
+                // For now, just simulate saving
+                kotlinx.coroutines.delay(1000)
+                
+                _uiState.update {
+                    it.copy(
+                        isSaving = false,
+                        error = null
+                    )
+                }
+                
+                // TODO: Show success message
+                
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isSaving = false,
+                        error = e.message ?: "Failed to save form"
+                    )
+                }
+            }
+        }
+    }
+
+    fun exportPDF() {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isExporting = true) }
+            
+            try {
+                val validationErrors = validateForm(uiState.value.formSections, uiState.value.formData)
+                
+                if (validationErrors.isNotEmpty()) {
+                    _uiState.update {
+                        it.copy(
+                            isExporting = false,
+                            fieldErrors = validationErrors,
+                            error = "Please fix the validation errors before exporting"
+                        )
+                    }
+                    return@launch
+                }
+                
+                // Generate PDF with form data overlaid on template
+                val currentState = uiState.value
+                val outputPath = "${File.separator}storage${File.separator}emulated${File.separator}0${File.separator}Download${File.separator}${currentState.formTitle.replace(" ", "_")}.pdf"
+                
+                val result = pdfExportService.exportFormToPDF(
+                    formId = currentState.formSections.firstOrNull()?.title?.lowercase()?.replace(" ", "_") ?: "unknown",
+                    formTitle = currentState.formTitle,
+                    formSections = currentState.formSections,
+                    formData = currentState.formData,
+                    outputPath = outputPath
+                )
+                
+                if (result.isFailure) {
+                    throw result.exceptionOrNull() ?: Exception("PDF export failed")
+                }
+                
+                _uiState.update {
+                    it.copy(
+                        isExporting = false,
+                        error = null
+                    )
+                }
+                
+                // TODO: Show success message and offer to share PDF
+                
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isExporting = false,
+                        error = e.message ?: "Failed to export PDF"
+                    )
+                }
+            }
+        }
+    }
+
+    fun clearError() {
+        _uiState.update { it.copy(error = null) }
+    }
+
+    private fun validateForm(sections: List<FormSection>, formData: Map<String, String>): Map<String, String> {
+        val errors = mutableMapOf<String, String>()
+        
+        sections.forEach { section ->
+            section.fields.forEach { field ->
+                val value = formData[field.fieldName] ?: ""
+                
+                // Required field validation
+                if (field.isRequired && value.isBlank()) {
+                    errors[field.fieldName] = "This field is required"
+                    return@forEach
+                }
+                
+                // Skip validation for empty optional fields
+                if (value.isBlank()) return@forEach
+                
+                // Type-specific validation
+                when (field.fieldType) {
+                    FormFieldType.NUMBER -> {
+                        value.toDoubleOrNull() ?: run {
+                            errors[field.fieldName] = "Please enter a valid number"
+                        }
+                    }
+                    FormFieldType.INTEGER -> {
+                        value.toIntOrNull() ?: run {
+                            errors[field.fieldName] = "Please enter a valid integer"
+                        }
+                    }
+                    FormFieldType.DATE -> {
+                        if (!isValidDate(value)) {
+                            errors[field.fieldName] = "Please enter a valid date (DD/MM/YYYY)"
+                        }
+                    }
+                    FormFieldType.TIME -> {
+                        if (!isValidTime(value)) {
+                            errors[field.fieldName] = "Please enter a valid time (HH:MM)"
+                        }
+                    }
+                    else -> {
+                        // No additional validation needed for other types
+                    }
+                }
+                
+                // Custom validation rules
+                field.validation?.let { validation ->
+                    validation.minLength?.let { minLength ->
+                        if (value.length < minLength) {
+                            errors[field.fieldName] = "Must be at least $minLength characters"
+                        }
+                    }
+                    
+                    validation.maxLength?.let { maxLength ->
+                        if (value.length > maxLength) {
+                            errors[field.fieldName] = "Must be at most $maxLength characters"
+                        }
+                    }
+                    
+                    validation.pattern?.let { pattern ->
+                        if (!value.matches(Regex(pattern))) {
+                            errors[field.fieldName] = validation.customMessage ?: "Invalid format"
+                        }
+                    }
+                }
+            }
+        }
+        
+        return errors
+    }
+
+    private fun isValidDate(dateString: String): Boolean {
+        // Simple date validation for DD/MM/YYYY format
+        val datePattern = Regex("^\\d{2}/\\d{2}/\\d{4}$")
+        return datePattern.matches(dateString)
+    }
+
+    private fun isValidTime(timeString: String): Boolean {
+        // Simple time validation for HH:MM format
+        val timePattern = Regex("^\\d{2}:\\d{2}$")
+        return timePattern.matches(timeString)
+    }
+
+    private fun getFormTemplate(formType: String): FormTemplate {
+        // For now, return a sample form template based on the PDF coordinate maps
+        return when (formType) {
+            "pump_inspection_90day" -> createPumpInspectionForm()
+            "availability_utilization" -> createAvailabilityUtilizationForm()
+            "blast_hole_log" -> createBlastHoleLogForm()
+            "bowie_weekly" -> createBowieWeeklyForm()
+            "fire_extinguisher" -> createFireExtinguisherForm()
+            "job_card" -> createJobCardForm()
+            "chassis_maintenance" -> createChassisMaintenanceForm()
+            "handover_certificate" -> createHandoverCertificateForm()
+            "production_log" -> createProductionLogForm()
+            "quality_report" -> createQualityReportForm()
+            "monthly_maintenance" -> createMonthlyMaintenanceForm()
+            "bench_inspection" -> createBenchInspectionForm()
+            "pressure_trip_test" -> createPressureTripTestForm()
+            "pretask_assessment" -> createPretaskAssessmentForm()
+            else -> createDefaultForm()
+        }
+    }
+
+    private fun createPumpInspectionForm(): FormTemplate {
+        return FormTemplate(
+            formId = "pump_inspection_90day",
+            title = "90 Day Pump System Inspection Checklist",
+            sections = listOf(
+                FormSection(
+                    title = "Header Information",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "inspection_date",
+                            label = "Inspection Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true,
+                            placeholder = "DD/MM/YYYY"
+                        ),
+                        FormField(
+                            fieldName = "inspector_name",
+                            label = "Inspector Name",
+                            fieldType = FormFieldType.TEXT,
+                            isRequired = true,
+                            placeholder = "Inspector Full Name"
+                        ),
+                        FormField(
+                            fieldName = "equipment_id",
+                            label = "Equipment ID",
+                            fieldType = FormFieldType.EQUIPMENT_ID,
+                            isRequired = true,
+                            placeholder = "Equipment ID"
+                        ),
+                        FormField(
+                            fieldName = "serial_number",
+                            label = "Serial Number",
+                            fieldType = FormFieldType.TEXT,
+                            isRequired = true,
+                            placeholder = "Serial Number"
+                        ),
+                        FormField(
+                            fieldName = "pump_location",
+                            label = "Pump Location",
+                            fieldType = FormFieldType.TEXT,
+                            isRequired = true,
+                            placeholder = "Location/Site"
+                        ),
+                        FormField(
+                            fieldName = "service_hours",
+                            label = "Service Hours",
+                            fieldType = FormFieldType.NUMBER,
+                            isRequired = true,
+                            placeholder = "Operating Hours"
+                        )
+                    )
+                ),
+                FormSection(
+                    title = "Visual Inspection",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "pump_housing_condition",
+                            label = "Pump Housing Condition",
+                            fieldType = FormFieldType.DROPDOWN,
+                            isRequired = true,
+                            options = listOf("Satisfactory", "Defective", "Needs Attention")
+                        ),
+                        FormField(
+                            fieldName = "pump_housing_comments",
+                            label = "Pump Housing Comments",
+                            fieldType = FormFieldType.MULTILINE_TEXT,
+                            placeholder = "Comments on pump housing condition"
+                        ),
+                        FormField(
+                            fieldName = "coupling_condition",
+                            label = "Coupling Condition",
+                            fieldType = FormFieldType.DROPDOWN,
+                            isRequired = true,
+                            options = listOf("Satisfactory", "Defective", "Needs Attention")
+                        ),
+                        FormField(
+                            fieldName = "coupling_comments",
+                            label = "Coupling Comments",
+                            fieldType = FormFieldType.MULTILINE_TEXT,
+                            placeholder = "Comments on coupling condition"
+                        ),
+                        FormField(
+                            fieldName = "motor_condition",
+                            label = "Motor Condition",
+                            fieldType = FormFieldType.DROPDOWN,
+                            isRequired = true,
+                            options = listOf("Satisfactory", "Defective", "Needs Attention")
+                        ),
+                        FormField(
+                            fieldName = "motor_comments",
+                            label = "Motor Comments",
+                            fieldType = FormFieldType.MULTILINE_TEXT,
+                            placeholder = "Comments on motor condition"
+                        )
+                    )
+                ),
+                FormSection(
+                    title = "Signature",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "inspector_signature",
+                            label = "Inspector Signature",
+                            fieldType = FormFieldType.SIGNATURE,
+                            isRequired = true
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    private fun createAvailabilityUtilizationForm(): FormTemplate {
+        return FormTemplate(
+            id = "availability_utilization",
+            name = "Availability & Utilization Report",
+            description = "Equipment availability and utilization tracking form",
+            formType = FormType.AVAILABILITY_UTILIZATION,
+            templateFile = "availability_utilization_template.pdf",
+            pdfTemplate = "availability_utilization_template.pdf",
+            fieldMappings = emptyList(),
+            fields = listOf(
+                FormSection(
+                    title = "Report Information",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "report_date",
+                            label = "Report Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "equipment_id",
+                            label = "Equipment ID",
+                            fieldType = FormFieldType.EQUIPMENT_ID,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "availability_percentage",
+                            label = "Availability (%)",
+                            fieldType = FormFieldType.NUMBER,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "utilization_percentage",
+                            label = "Utilization (%)",
+                            fieldType = FormFieldType.NUMBER,
+                            isRequired = true
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    // Add other form creation methods as needed
+    private fun createBlastHoleLogForm(): FormTemplate {
+        return FormTemplate(
+            formId = "blast_hole_log",
+            title = "Blast Hole Log",
+            sections = listOf(
+                FormSection(
+                    title = "Basic Information",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "log_date",
+                            label = "Log Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "hole_number",
+                            label = "Hole Number",
+                            fieldType = FormFieldType.TEXT,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "depth",
+                            label = "Depth (m)",
+                            fieldType = FormFieldType.NUMBER,
+                            isRequired = true
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    private fun createBowieWeeklyForm(): FormTemplate {
+        return FormTemplate(
+            formId = "bowie_weekly",
+            title = "Bowie Pump Weekly Check List",
+            sections = listOf(
+                FormSection(
+                    title = "Weekly Check",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "check_date",
+                            label = "Check Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "pump_id",
+                            label = "Pump ID",
+                            fieldType = FormFieldType.EQUIPMENT_ID,
+                            isRequired = true
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    private fun createFireExtinguisherForm(): FormTemplate {
+        return FormTemplate(
+            formId = "fire_extinguisher",
+            title = "Fire Extinguisher Inspection Checklist",
+            sections = listOf(
+                FormSection(
+                    title = "Inspection Details",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "inspection_date",
+                            label = "Inspection Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "extinguisher_id",
+                            label = "Extinguisher ID",
+                            fieldType = FormFieldType.TEXT,
+                            isRequired = true
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    private fun createJobCardForm(): FormTemplate {
+        return FormTemplate(
+            formId = "job_card",
+            title = "Job Card",
+            sections = listOf(
+                FormSection(
+                    title = "Job Information",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "job_date",
+                            label = "Job Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "job_description",
+                            label = "Job Description",
+                            fieldType = FormFieldType.MULTILINE_TEXT,
+                            isRequired = true
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    private fun createChassisMaintenanceForm(): FormTemplate {
+        return FormTemplate(
+            formId = "chassis_maintenance",
+            title = "MMU Chassis Maintenance Record",
+            sections = listOf(
+                FormSection(
+                    title = "Maintenance Information",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "maintenance_date",
+                            label = "Maintenance Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "mmu_id",
+                            label = "MMU ID",
+                            fieldType = FormFieldType.EQUIPMENT_ID,
+                            isRequired = true
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    private fun createHandoverCertificateForm(): FormTemplate {
+        return FormTemplate(
+            formId = "handover_certificate",
+            title = "MMU Handover Certificate",
+            sections = listOf(
+                FormSection(
+                    title = "Handover Information",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "handover_date",
+                            label = "Handover Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "mmu_id",
+                            label = "MMU ID",
+                            fieldType = FormFieldType.EQUIPMENT_ID,
+                            isRequired = true
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    private fun createProductionLogForm(): FormTemplate {
+        return FormTemplate(
+            formId = "production_log",
+            title = "MMU Production Daily Log",
+            sections = listOf(
+                FormSection(
+                    title = "Production Information",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "production_date",
+                            label = "Production Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "mmu_id",
+                            label = "MMU ID",
+                            fieldType = FormFieldType.EQUIPMENT_ID,
+                            isRequired = true
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    private fun createQualityReportForm(): FormTemplate {
+        return FormTemplate(
+            formId = "quality_report",
+            title = "MMU Quality Report",
+            sections = listOf(
+                FormSection(
+                    title = "Quality Information",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "report_date",
+                            label = "Report Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "mmu_id",
+                            label = "MMU ID",
+                            fieldType = FormFieldType.EQUIPMENT_ID,
+                            isRequired = true
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    private fun createMonthlyMaintenanceForm(): FormTemplate {
+        return FormTemplate(
+            formId = "monthly_maintenance",
+            title = "Monthly Process Maintenance Record",
+            sections = listOf(
+                FormSection(
+                    title = "Monthly Maintenance",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "maintenance_date",
+                            label = "Maintenance Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "equipment_id",
+                            label = "Equipment ID",
+                            fieldType = FormFieldType.EQUIPMENT_ID,
+                            isRequired = true
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    private fun createBenchInspectionForm(): FormTemplate {
+        return FormTemplate(
+            formId = "bench_inspection",
+            title = "On Bench MMU Inspection",
+            sections = listOf(
+                FormSection(
+                    title = "Inspection Information",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "inspection_date",
+                            label = "Inspection Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "mmu_id",
+                            label = "MMU ID",
+                            fieldType = FormFieldType.EQUIPMENT_ID,
+                            isRequired = true
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    private fun createPressureTripTestForm(): FormTemplate {
+        return FormTemplate(
+            formId = "pressure_trip_test",
+            title = "PC Pump High/Low Pressure Trip Test",
+            sections = listOf(
+                FormSection(
+                    title = "Test Information",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "test_date",
+                            label = "Test Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "pump_id",
+                            label = "Pump ID",
+                            fieldType = FormFieldType.EQUIPMENT_ID,
+                            isRequired = true
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    private fun createPretaskAssessmentForm(): FormTemplate {
+        return FormTemplate(
+            formId = "pretask_assessment",
+            title = "Pre-Task Safety Assessment",
+            sections = listOf(
+                FormSection(
+                    title = "Assessment Information",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "assessment_date",
+                            label = "Assessment Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "task_description",
+                            label = "Task Description",
+                            fieldType = FormFieldType.MULTILINE_TEXT,
+                            isRequired = true
+                        )
+                    )
+                )
+            )
+        )
+    }
+
+    private fun createDefaultForm(): FormTemplate {
+        return FormTemplate(
+            formId = "default",
+            title = "Default Form",
+            sections = listOf(
+                FormSection(
+                    title = "Basic Information",
+                    fields = listOf(
+                        FormField(
+                            fieldName = "form_date",
+                            label = "Form Date",
+                            fieldType = FormFieldType.DATE,
+                            isRequired = true
+                        ),
+                        FormField(
+                            fieldName = "form_notes",
+                            label = "Notes",
+                            fieldType = FormFieldType.MULTILINE_TEXT,
+                            placeholder = "Enter any additional notes here"
+                        )
+                    )
+                )
+            )
+        )
+    }
+} 
